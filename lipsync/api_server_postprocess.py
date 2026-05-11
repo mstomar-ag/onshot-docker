@@ -19,6 +19,7 @@ import os
 import shutil
 import subprocess
 import threading
+import time
 import uuid
 from pathlib import Path
 from typing import Optional
@@ -27,7 +28,7 @@ import cv2
 import numpy as np
 
 try:
-    from fastapi import FastAPI, File, Form, UploadFile
+    from fastapi import FastAPI, File, Form, HTTPException, UploadFile
     from fastapi.responses import FileResponse, JSONResponse
 except ImportError:
     raise SystemExit("FastAPI not installed. Run: pip install fastapi uvicorn python-multipart")
@@ -824,6 +825,192 @@ async def postprocess(
     finally:
         # Note: cleanup deferred — FastAPI streams the file before this runs
         pass
+
+
+# ---------------------------------------------------------------------------
+# Async post-process API (kolkata-diwali-alpana-arjun 2026-05-11, R40)
+#
+# The synchronous /api/v1/postprocess above streams the result back in the
+# SAME HTTP response. For 6-second clips CodeFormer alone takes ~70s; total
+# pipeline can hit 110-130s. RunPod's HTTP proxy enforces a ~100s read
+# timeout, so the proxy returns 524 even though the sidecar is still
+# working (and ultimately completes successfully). The client then falls
+# back to the raw LatentSync output and skips face cleanup.
+#
+# These async endpoints decouple submit from result so each individual
+# HTTP call returns in <1s — well under any proxy timeout.
+#
+#   POST /api/v1/postprocess/submit  → 202 { "job_id": "..." }
+#     (background thread runs the pipeline)
+#   GET  /api/v1/postprocess/status/{job_id} → { state: queued|running|done|failed, error?: }
+#   GET  /api/v1/postprocess/result/{job_id} → streams the mp4 (only after state=done)
+#
+# In-memory job table — single-pod sidecar so no Redis needed.
+# Old jobs auto-purged after RESULT_TTL_SEC to avoid filesystem fill.
+# ---------------------------------------------------------------------------
+
+_PP_JOBS: dict = {}
+_PP_JOBS_LOCK = threading.Lock()
+RESULT_TTL_SEC = 1800  # 30 min — generous, lipsync worker downloads within seconds
+
+
+def _pp_purge_expired() -> None:
+    """Drop in-memory job records older than RESULT_TTL_SEC and delete their files."""
+    now = time.time()
+    with _PP_JOBS_LOCK:
+        stale = [jid for jid, r in _PP_JOBS.items()
+                 if now - r.get("created_at", now) > RESULT_TTL_SEC]
+        for jid in stale:
+            r = _PP_JOBS.pop(jid, None)
+            if r and r.get("run_dir"):
+                shutil.rmtree(r["run_dir"], ignore_errors=True)
+
+
+def _pp_pipeline_worker(job_id: str, run_dir: Path, raw_path: str, orig_path: str,
+                        params: dict) -> None:
+    """Run the same pipeline as the sync endpoint, but stash result in the
+    job table instead of streaming it back. Errors land in the job table too
+    so the client sees them via /status."""
+    with _PP_JOBS_LOCK:
+        _PP_JOBS[job_id]["state"] = "running"
+
+    current = raw_path
+    try:
+        logger.info(f"[{job_id}] async pipeline start: gfpgan={params['enable_gfpgan']}, "
+                    f"feathered={params['enable_feathered_blend']}, codeformer={params['enable_codeformer']}, "
+                    f"temporal={params['enable_temporal_smoothing']}")
+
+        if params["enable_gfpgan"]:
+            out = str(run_dir / "step1_gfpgan.mp4")
+            if apply_gfpgan(current, out):
+                current = out
+                logger.info(f"[{job_id}] GFPGAN done")
+            else:
+                logger.warning(f"[{job_id}] GFPGAN skipped/failed")
+
+        if params["enable_feathered_blend"]:
+            out = str(run_dir / "step2_blend.mp4")
+            if apply_feathered_blend(orig_path, current, out,
+                                      params["feather_radius_px"],
+                                      params["min_face_confidence"],
+                                      params["full_blend_confidence"]):
+                current = out
+                logger.info(f"[{job_id}] Feathered blend done")
+            else:
+                logger.warning(f"[{job_id}] Feathered blend skipped/failed")
+
+        if params["enable_codeformer"]:
+            out = str(run_dir / "step3_codeformer.mp4")
+            if apply_codeformer(current, out,
+                                 params["codeformer_weight"],
+                                 params["codeformer_mouth_only"]):
+                current = out
+                logger.info(f"[{job_id}] CodeFormer done")
+            else:
+                logger.warning(f"[{job_id}] CodeFormer skipped/failed")
+
+        if params["enable_temporal_smoothing"]:
+            out = str(run_dir / "step4_smooth.mp4")
+            if apply_temporal_smoothing(current, out, params["temporal_smooth_alpha"]):
+                current = out
+                logger.info(f"[{job_id}] Temporal smoothing done")
+            else:
+                logger.warning(f"[{job_id}] Temporal smoothing skipped/failed")
+
+        logger.info(f"[{job_id}] async pipeline complete")
+        with _PP_JOBS_LOCK:
+            _PP_JOBS[job_id]["state"] = "done"
+            _PP_JOBS[job_id]["output_path"] = current
+    except Exception as e:
+        logger.error(f"[{job_id}] async pipeline failed: {e}")
+        with _PP_JOBS_LOCK:
+            _PP_JOBS[job_id]["state"] = "failed"
+            _PP_JOBS[job_id]["error"] = str(e)
+
+
+@app.post("/api/v1/postprocess/submit")
+async def postprocess_submit(
+    raw_video: UploadFile = File(...),
+    original_video: UploadFile = File(...),
+    enable_feathered_blend: bool = Form(True),
+    feather_radius_px: int = Form(35),
+    min_face_confidence: float = Form(0.6),
+    full_blend_confidence: float = Form(0.85),
+    enable_gfpgan: bool = Form(False),
+    enable_codeformer: bool = Form(False),
+    codeformer_weight: float = Form(0.5),
+    codeformer_mouth_only: bool = Form(False),
+    enable_temporal_smoothing: bool = Form(False),
+    temporal_smooth_alpha: float = Form(0.25),
+):
+    """Async submit — returns job_id immediately; client polls /status."""
+    _pp_purge_expired()
+    job_id = uuid.uuid4().hex[:12]
+    run_dir = TEMP_DIR / job_id
+    run_dir.mkdir(parents=True, exist_ok=True)
+    raw_path = str(run_dir / "raw.mp4")
+    orig_path = str(run_dir / "original.mp4")
+    with open(raw_path, "wb") as f:
+        shutil.copyfileobj(raw_video.file, f)
+    with open(orig_path, "wb") as f:
+        shutil.copyfileobj(original_video.file, f)
+
+    params = {
+        "enable_feathered_blend": enable_feathered_blend,
+        "feather_radius_px": feather_radius_px,
+        "min_face_confidence": min_face_confidence,
+        "full_blend_confidence": full_blend_confidence,
+        "enable_gfpgan": enable_gfpgan,
+        "enable_codeformer": enable_codeformer,
+        "codeformer_weight": codeformer_weight,
+        "codeformer_mouth_only": codeformer_mouth_only,
+        "enable_temporal_smoothing": enable_temporal_smoothing,
+        "temporal_smooth_alpha": temporal_smooth_alpha,
+    }
+
+    with _PP_JOBS_LOCK:
+        _PP_JOBS[job_id] = {
+            "state": "queued",
+            "created_at": time.time(),
+            "run_dir": str(run_dir),
+            "output_path": None,
+            "error": None,
+        }
+
+    t = threading.Thread(
+        target=_pp_pipeline_worker,
+        args=(job_id, run_dir, raw_path, orig_path, params),
+        daemon=True,
+    )
+    t.start()
+
+    return JSONResponse({"job_id": job_id, "state": "queued"}, status_code=202)
+
+
+@app.get("/api/v1/postprocess/status/{job_id}")
+async def postprocess_status(job_id: str):
+    """Return job state. Polled by client every few seconds."""
+    with _PP_JOBS_LOCK:
+        rec = _PP_JOBS.get(job_id)
+    if rec is None:
+        raise HTTPException(status_code=404, detail="job not found (expired or never existed)")
+    return {
+        "job_id": job_id,
+        "state": rec["state"],
+        "error": rec.get("error"),
+    }
+
+
+@app.get("/api/v1/postprocess/result/{job_id}")
+async def postprocess_result(job_id: str):
+    """Stream the final processed mp4. Only valid when state=done."""
+    with _PP_JOBS_LOCK:
+        rec = _PP_JOBS.get(job_id)
+    if rec is None:
+        raise HTTPException(status_code=404, detail="job not found")
+    if rec["state"] != "done":
+        raise HTTPException(status_code=409, detail=f"job state is {rec['state']!r} (need 'done')")
+    return FileResponse(rec["output_path"], media_type="video/mp4", filename="postprocessed.mp4")
 
 
 @app.on_event("shutdown")
