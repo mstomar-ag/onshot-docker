@@ -47,18 +47,46 @@ if command -v sshd >/dev/null 2>&1; then
     echo "[entrypoint] sshd started (pid=$!)"
 fi
 
-# Resolve ComfyUI dir at boot. Build-time clone landed at /workspace/ComfyUI
-# (the find fallback in Dockerfile). If a runtime install populates a
-# different path (e.g. /workspace/runpod-slim/ComfyUI), prefer that.
+# Resolve ComfyUI dir at boot.
+#
+# v1.6.9 FIX (kolkata-diwali-alpana-arjun, 2026-05-11):
+# The runpod/comfyui base image places ComfyUI at /opt/comfyui-baked (note
+# the lowercase + `-baked` suffix) and our Dockerfile creates a build-time
+# symlink at /workspace/ComfyUI → /opt/comfyui-baked. But RunPod mounts
+# /workspace as a network filesystem on pod boot, which **shadows** the
+# build-time symlink — so the symlink is invisible at runtime.
+#
+# Prior versions only searched paths under /workspace and /opt/ComfyUI
+# (capital C), missed /opt/comfyui-baked, fell back to a case-sensitive
+# */ComfyUI/main.py find, missed it again, then dropped into degraded
+# sleep-only mode with no ComfyUI. Symptom: every v1.6.8 pod had :8000
+# sidecar healthy but :8188 ComfyUI 502 forever.
+#
+# Fix: search /opt/comfyui-baked FIRST (it's where the base image puts
+# ComfyUI), then the other candidate paths, and use a broader case-
+# insensitive find as the last-resort fallback.
 COMFY_DIR=""
-for d in /workspace/ComfyUI /workspace/runpod-slim/ComfyUI /opt/ComfyUI /comfyui; do
+for d in /opt/comfyui-baked /workspace/ComfyUI /workspace/runpod-slim/ComfyUI /opt/ComfyUI /comfyui; do
     if [ -f "$d/main.py" ]; then COMFY_DIR="$d"; break; fi
 done
 if [ -z "$COMFY_DIR" ]; then
-    COMFY_DIR=$(find / -maxdepth 5 -type f -name main.py -path '*/ComfyUI/main.py' 2>/dev/null | head -1)
+    # Broader fallback: any */(c|C)omfy*/main.py, depth 6 (covers nested
+    # base-image layouts and case variants).
+    COMFY_DIR=$(find / -maxdepth 6 -type f -name main.py 2>/dev/null \
+        | grep -iE '/(comfyui|comfyui-baked|comfy)/main\.py$' \
+        | head -1)
     [ -n "$COMFY_DIR" ] && COMFY_DIR=$(dirname "$COMFY_DIR")
 fi
 echo "[entrypoint] ComfyUI dir resolved: ${COMFY_DIR:-<NOT FOUND>}"
+
+# Re-establish the /workspace/ComfyUI convenience symlink for downstream
+# consumers (paths that hard-code /workspace/ComfyUI/custom_nodes/...).
+# Build-time we created this symlink, but RunPod's network-volume mount of
+# /workspace at boot hides it — recreate it now if missing.
+if [ -n "$COMFY_DIR" ] && [ "$COMFY_DIR" != "/workspace/ComfyUI" ] && [ ! -e "/workspace/ComfyUI" ]; then
+    ln -sfn "$COMFY_DIR" /workspace/ComfyUI
+    echo "[entrypoint] recreated /workspace/ComfyUI -> $COMFY_DIR symlink (network-volume shadowed build-time symlink)"
+fi
 
 # --- Pre-flight import checks (CI-O-58w) ---
 # Validate the runtime stack BEFORE we kick off the heavy services. Any
