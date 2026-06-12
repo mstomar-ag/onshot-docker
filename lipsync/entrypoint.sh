@@ -24,17 +24,17 @@
 mkdir -p /workspace
 cd /workspace
 
-# --- FIX (v1.6.11-optfix): restore the baked tree shadowed by RunPod's /workspace mount ---
-# RunPod mounts the pod volume over /workspace at boot, hiding everything baked there at
-# build time. We stashed it to /opt/baked_workspace (not a mount point) in the Dockerfile;
-# restore it now, BEFORE resolving ComfyUI / starting servers. The guard makes this a no-op
-# on a persistent volume that's already populated (only restores when /workspace is empty).
-if [ -d /opt/baked_workspace ] && [ ! -e /workspace/ComfyUI ]; then
-    echo "[entrypoint] /workspace empty (shadowed by RunPod mount) — restoring baked tree from /opt/baked_workspace ..."
-    cp -a /opt/baked_workspace/. /workspace/ \
-        && echo "[entrypoint] restore complete ($(du -sh /workspace 2>/dev/null | cut -f1))" \
-        || echo "[entrypoint] WARNING: restore failed"
-fi
+# --- FIX (v1.6.11-optfix5): run straight from /opt — NO /workspace restore copy ---
+# RunPod mounts the pod volume over /workspace at boot, shadowing everything baked there.
+# We stashed the whole baked tree to /opt/baked_workspace (NOT a mount point) in the Dockerfile.
+# Earlier versions copied 10 GB back into /workspace at boot, which was slow + flaky (ComfyUI
+# sometimes never came up in time -> proxy 404). Instead we run everything FROM /opt directly:
+#   - ComfyUI: resolved to /opt/baked_workspace/ComfyUI below (it has the LatentSync node).
+#   - Postprocess sidecar: point its WORKSPACE env at /opt so it finds CodeFormer + GFPGAN
+#     weights (api_server_postprocess.py reads WORKSPACE, default /workspace).
+# No multi-GB boot copy => fast, deterministic boot.
+export WORKSPACE=/opt/baked_workspace
+echo "[entrypoint] running from /opt/baked_workspace (no /workspace restore); WORKSPACE=$WORKSPACE"
 
 # CI-O-21 safety net (also baked into Dockerfile ENV, kept here for clarity).
 export TORCHAUDIO_USE_BACKEND_DISPATCHER=1
@@ -88,7 +88,7 @@ for d in /workspace/ComfyUI /opt/comfyui-baked /workspace/runpod-slim/ComfyUI /o
 done
 # Fallback 1: any ComfyUI with main.py (degraded — LatentSyncNode may be missing).
 if [ -z "$COMFY_DIR" ]; then
-    for d in /workspace/ComfyUI /opt/comfyui-baked /workspace/runpod-slim/ComfyUI /opt/ComfyUI /comfyui; do
+    for d in /opt/baked_workspace/ComfyUI /workspace/ComfyUI /opt/comfyui-baked /workspace/runpod-slim/ComfyUI /opt/ComfyUI /comfyui; do
         if [ -f "$d/main.py" ]; then COMFY_DIR="$d"; break; fi
     done
 fi
