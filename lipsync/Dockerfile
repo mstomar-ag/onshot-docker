@@ -114,6 +114,20 @@ RUN pip install --break-system-packages --force-reinstall --no-deps \
         torchcodec --index-url https://download.pytorch.org/whl/cu128 \
  && echo "torchcodec (cu128) installed: $(python3 -c 'import importlib.metadata as m; print(m.version(\"torchcodec\"))' 2>/dev/null || echo '?')"
 
+# --- FIX (v1.6.11-optfix4): make ALL CUDA-12 libs discoverable for torchcodec ---
+# The cu128 torchcodec links a chain of NVIDIA libs (nvrtc, NPP/libnppicc.so.12, cudart, …).
+# Two problems on this base: (1) NPP isn't installed; (2) the nvidia pip packages put their
+# .so's under .../dist-packages/nvidia/*/lib, which is NOT on the dynamic-loader path, so
+# torchcodec's dlopen can't find them. Install NPP, then register EVERY nvidia pip lib dir
+# with ldconfig so the whole chain resolves in one shot (build-verified on libnppicc.so.12).
+RUN pip install --break-system-packages nvidia-npp-cu12 \
+ && find /usr -type d -path '*/dist-packages/nvidia/*/lib' 2>/dev/null > /etc/ld.so.conf.d/nvidia-cu12.conf \
+ && echo "registered nvidia lib dirs:" && cat /etc/ld.so.conf.d/nvidia-cu12.conf \
+ && ldconfig \
+ && (ldconfig -p | grep -q 'libnppicc.so.12' \
+        && echo "libnppicc.so.12 discoverable OK" \
+        || (echo "FATAL: libnppicc.so.12 still not found" && exit 1))
+
 # --- Step 2: ComfyUI-VideoHelperSuite (mirrors deploy script:240-256) ---
 ARG VIDEO_HELPER_REPO=https://github.com/Kosinkadink/ComfyUI-VideoHelperSuite.git
 RUN cd /workspace/ComfyUI/custom_nodes \
@@ -235,7 +249,7 @@ LABEL org.opencontainers.image.title="onshot-lipsync-latentsync"
 LABEL org.opencontainers.image.description="OnShot lipsync pod — ComfyUI + LatentSync 1.6 + post-processing sidecar, fully baked"
 LABEL org.opencontainers.image.source="https://github.com/Agrim-Intelligence/onshot-docker"
 LABEL org.opencontainers.image.licenses="proprietary"
-LABEL org.opencontainers.image.version="1.6.11-optfix3"
+LABEL org.opencontainers.image.version="1.6.11-optfix4"
 LABEL onshot.role="lipsync"
 LABEL onshot.engine="latentsync-1.6"
 
