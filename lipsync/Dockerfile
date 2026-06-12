@@ -103,6 +103,22 @@ RUN cd /workspace/ComfyUI/custom_nodes \
  && pip install --break-system-packages insightface onnxruntime-gpu accelerate \
  && pip install --break-system-packages librosa
 
+# --- FIX (v1.6.11-optfix2): torchcodec CUDA-13 build needs libnvrtc.so.13 ---
+# The `runpod/comfyui:latest` base drifted: its ComfyUI loads audio via torchcodec, and the
+# `--upgrade torchcodec` above pulls a CUDA-13 build whose .so needs libnvrtc.so.13 — absent
+# on the CUDA-12.8 base, so ComfyUI's LoadAudio node crashes ("libnvrtc.so.13: cannot open
+# shared object file"). Provide the CUDA-13 nvrtc runtime and register it with ldconfig.
+# (torchcodec only decodes audio on CPU, so it coexists fine with the cu128 torch used for
+# inference.) Build fails loudly if the lib doesn't end up registered.
+RUN pip install --break-system-packages nvidia-cuda-nvrtc-cu13 \
+ && NVRTC_DIR="$(python3 -c 'import os,nvidia.cuda_nvrtc as m; print(os.path.join(os.path.dirname(m.__file__),"lib"))')" \
+ && echo "nvrtc lib dir: $NVRTC_DIR" \
+ && echo "$NVRTC_DIR" > /etc/ld.so.conf.d/nvrtc-cu13.conf \
+ && ldconfig \
+ && (ldconfig -p | grep -q 'libnvrtc.so.13' \
+        && echo "libnvrtc.so.13 registered OK" \
+        || (echo "FATAL: libnvrtc.so.13 still missing after install" && exit 1))
+
 # --- Step 2: ComfyUI-VideoHelperSuite (mirrors deploy script:240-256) ---
 ARG VIDEO_HELPER_REPO=https://github.com/Kosinkadink/ComfyUI-VideoHelperSuite.git
 RUN cd /workspace/ComfyUI/custom_nodes \
@@ -224,7 +240,7 @@ LABEL org.opencontainers.image.title="onshot-lipsync-latentsync"
 LABEL org.opencontainers.image.description="OnShot lipsync pod — ComfyUI + LatentSync 1.6 + post-processing sidecar, fully baked"
 LABEL org.opencontainers.image.source="https://github.com/Agrim-Intelligence/onshot-docker"
 LABEL org.opencontainers.image.licenses="proprietary"
-LABEL org.opencontainers.image.version="1.6.11-optfix"
+LABEL org.opencontainers.image.version="1.6.11-optfix2"
 LABEL onshot.role="lipsync"
 LABEL onshot.engine="latentsync-1.6"
 
