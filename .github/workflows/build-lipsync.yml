@@ -84,9 +84,12 @@ jobs:
           file: lipsync/Dockerfile
           platforms: linux/amd64
           push: true
+          # NOTE (fix/lipsync-opt-relocate-shadow branch): only the unique version tag —
+          # the `:latest` tag is intentionally NOT pushed here so this experimental branch
+          # build can never clobber the image other pipelines pull. Do not re-add :latest
+          # on this branch.
           tags: |
             ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ steps.version.outputs.tag }}
-            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest
           # Layer cache between runs — the 7 GB checkpoint downloads are the
           # most expensive layer; cache them aggressively.
           cache-from: type=gha
@@ -103,6 +106,6 @@ jobs:
             echo "## Lipsync image published"
             echo ""
             echo "- Tag: \`${REGISTRY_URL}/${IMAGE_REF}:${IMAGE_TAG}\`"
-            echo "- Also tagged \`:latest\`"
+            echo "- (branch build — \`:latest\` intentionally NOT updated)"
             echo "- Pull with: \`docker pull ${REGISTRY_URL}/${IMAGE_REF}:${IMAGE_TAG}\`"
           } >> "$GITHUB_STEP_SUMMARY"

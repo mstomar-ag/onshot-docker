@@ -198,6 +198,17 @@ RUN mkdir -p /workspace/gfpgan_weights \
         -o /workspace/gfpgan_weights/GFPGANv1.4.pth \
         'https://github.com/TencentARC/GFPGAN/releases/download/v1.3.0/GFPGANv1.4.pth'
 
+# --- FIX (v1.6.11-optfix): un-shadow the baked tree ---------------------------
+# RunPod mounts the pod volume over /workspace at boot, which SHADOWS everything
+# this image baked there (ComfyUI + custom_nodes + 7 GB checkpoints + CodeFormer +
+# GFPGAN weights) — so LatentSyncNode never registers and the postprocess weights
+# vanish. /opt is NOT a mount point, so we stash the whole baked /workspace there;
+# the entrypoint restores it into the (mounted, empty) /workspace before starting
+# the servers. `mv` (not `cp`) keeps the image the same size — the data lives once.
+# See onshot-lipsync docs/runpod-image-setup.md for the full root cause.
+RUN mv /workspace /opt/baked_workspace && mkdir -p /workspace \
+ && echo "stashed baked tree to /opt/baked_workspace ($(du -sh /opt/baked_workspace | cut -f1))"
+
 # --- Postprocess server + entrypoint ---
 COPY api_server_postprocess.py /opt/api_server_postprocess.py
 COPY entrypoint.sh /entrypoint.sh
@@ -213,7 +224,7 @@ LABEL org.opencontainers.image.title="onshot-lipsync-latentsync"
 LABEL org.opencontainers.image.description="OnShot lipsync pod — ComfyUI + LatentSync 1.6 + post-processing sidecar, fully baked"
 LABEL org.opencontainers.image.source="https://github.com/Agrim-Intelligence/onshot-docker"
 LABEL org.opencontainers.image.licenses="proprietary"
-LABEL org.opencontainers.image.version="1.6.10"
+LABEL org.opencontainers.image.version="1.6.11-optfix"
 LABEL onshot.role="lipsync"
 LABEL onshot.engine="latentsync-1.6"
 

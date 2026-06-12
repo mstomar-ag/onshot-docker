@@ -24,6 +24,18 @@
 mkdir -p /workspace
 cd /workspace
 
+# --- FIX (v1.6.11-optfix): restore the baked tree shadowed by RunPod's /workspace mount ---
+# RunPod mounts the pod volume over /workspace at boot, hiding everything baked there at
+# build time. We stashed it to /opt/baked_workspace (not a mount point) in the Dockerfile;
+# restore it now, BEFORE resolving ComfyUI / starting servers. The guard makes this a no-op
+# on a persistent volume that's already populated (only restores when /workspace is empty).
+if [ -d /opt/baked_workspace ] && [ ! -e /workspace/ComfyUI ]; then
+    echo "[entrypoint] /workspace empty (shadowed by RunPod mount) — restoring baked tree from /opt/baked_workspace ..."
+    cp -a /opt/baked_workspace/. /workspace/ \
+        && echo "[entrypoint] restore complete ($(du -sh /workspace 2>/dev/null | cut -f1))" \
+        || echo "[entrypoint] WARNING: restore failed"
+fi
+
 # CI-O-21 safety net (also baked into Dockerfile ENV, kept here for clarity).
 export TORCHAUDIO_USE_BACKEND_DISPATCHER=1
 export TORCHAUDIO_BACKEND=soundfile
@@ -66,12 +78,22 @@ fi
 # ComfyUI), then the other candidate paths, and use a broader case-
 # insensitive find as the last-resort fallback.
 COMFY_DIR=""
-for d in /opt/comfyui-baked /workspace/ComfyUI /workspace/runpod-slim/ComfyUI /opt/ComfyUI /comfyui; do
-    if [ -f "$d/main.py" ]; then COMFY_DIR="$d"; break; fi
+# v1.6.11-optfix: PREFER a ComfyUI that actually has the LatentSync custom node — after the
+# restore that's /workspace/ComfyUI. This avoids picking an empty base-image ComfyUI (e.g.
+# /opt/comfyui-baked) that has main.py but no custom_nodes (the original silent-fail mode).
+for d in /workspace/ComfyUI /opt/comfyui-baked /workspace/runpod-slim/ComfyUI /opt/ComfyUI /comfyui; do
+    if [ -f "$d/main.py" ] && [ -d "$d/custom_nodes/ComfyUI-LatentSyncWrapper" ]; then
+        COMFY_DIR="$d"; break
+    fi
 done
+# Fallback 1: any ComfyUI with main.py (degraded — LatentSyncNode may be missing).
 if [ -z "$COMFY_DIR" ]; then
-    # Broader fallback: any */(c|C)omfy*/main.py, depth 6 (covers nested
-    # base-image layouts and case variants).
+    for d in /workspace/ComfyUI /opt/comfyui-baked /workspace/runpod-slim/ComfyUI /opt/ComfyUI /comfyui; do
+        if [ -f "$d/main.py" ]; then COMFY_DIR="$d"; break; fi
+    done
+fi
+# Fallback 2: broad find (covers nested base-image layouts + case variants).
+if [ -z "$COMFY_DIR" ]; then
     COMFY_DIR=$(find / -maxdepth 6 -type f -name main.py 2>/dev/null \
         | grep -iE '/(comfyui|comfyui-baked|comfy)/main\.py$' \
         | head -1)
