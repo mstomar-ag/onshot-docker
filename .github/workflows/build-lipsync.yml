@@ -26,7 +26,9 @@ jobs:
     timeout-minutes: 120
     env:
       REGISTRY: ghcr.io
-      IMAGE_NAME: agrim-intelligence/lipsync-latentsync
+      # fork build: push to the fork owner's GHCR namespace (the fork's GITHUB_TOKEN can
+      # only write packages under its own owner), NOT the org's. Keeps everything isolated.
+      IMAGE_NAME: mstomar-ag/lipsync-latentsync
 
     steps:
       - name: Checkout
